@@ -5,8 +5,30 @@ This repository provides a complete starter implementation for the bachelor thes
 **"Neural Operator for Climate Data Restoration"** (LUT University).
 
 The code is adapted from [ClimateDiffuse](https://arxiv.org/abs/2404.17752) (Watt & Mansfield, 2024),
-retaining its data download and preprocessing pipeline, and replacing the diffusion / UNet model
-with a **Fourier Neural Operator (FNO)** (Li et al., ICLR 2021).
+retaining its preprocessing structure and residual training formulation, and replacing
+the diffusion/UNet model with a **Fourier Neural Operator (FNO)** (Li et al., ICLR 2021).
+
+---
+
+## Data: real fine and coarse ERA5 from ECMWF
+
+Unlike synthetic coarsening approaches, this project downloads **two separate ERA5 products**
+at their native resolutions directly from the Copernicus Climate Data Store (CDS):
+
+| | Resolution | Grid points (Europe) | Size / year |
+|---|---|---|---|
+| **Fine** | 0.25° × 0.25° | ~149 × 161 | ~18 MB |
+| **Coarse** | 1.50° × 1.50° | ~26 × 27 | ~0.4 MB |
+
+Both are real ECMWF reanalysis products — the coarse field is not an artificial
+degradation of the fine field.  The downscaling factor is **6×**.
+
+**Domain:** Western and Central Europe — 10°W to 30°E, 35°N to 72°N
+
+**Variables:** 2-metre temperature (T2m) and total precipitation (TP)
+
+**Dataset size:** 8 random time steps per month × 12 months = ~96 samples/year.
+For 1979–2021 (43 years) this gives ~4,100 training samples — manageable on a single moderate GPU.
 
 ---
 
@@ -14,20 +36,20 @@ with a **Fourier Neural Operator (FNO)** (Li et al., ICLR 2021).
 
 ```
 fno_climate/
-├── data/                          ← ERA5 NetCDF files go here (created by download script)
-├── checkpoints/                   ← Saved model weights
-├── results/                       ← Training figures and evaluation plots
-├── runs/                          ← TensorBoard logs
+├── data/                              ← ERA5 NetCDF files (created by download script)
+├── checkpoints/                       ← Saved model weights
+├── results/                           ← Training figures and evaluation plots
+├── runs/                              ← TensorBoard logs
 ├── download_ERA5/
-│   ├── download_era5_europe.sh    ← Master download + preprocess script
-│   ├── preprocess_subsample.py    ← Per-month subsampling and cropping
-│   └── preprocess_concat_year.py  ← Concatenate monthly → yearly files
+│   ├── download_era5_europe.sh        ← Master loop: calls the two scripts below
+│   ├── download_month_cds.py          ← Downloads one month at 0.25° AND 1.5° from CDS
+│   └── preprocess_concat_year.py      ← Merges monthly → yearly files
 ├── src/
-│   ├── dataset.py                 ← ERA5EuropeDataset: paired coarse/fine loader
-│   ├── model.py                   ← FNO2d: Fourier Neural Operator
-│   ├── train.py                   ← Training script
-│   └── evaluate.py                ← Evaluation + plotting script
-└── environment.yml                ← Conda environment
+│   ├── dataset.py                     ← ERA5EuropeDataset: real paired coarse/fine loader
+│   ├── model.py                       ← FNO2d: Fourier Neural Operator
+│   ├── train.py                       ← Training script
+│   └── evaluate.py                    ← Evaluation + plotting script
+└── environment.yml                    ← Conda environment
 ```
 
 ---
@@ -41,31 +63,47 @@ conda env create -f environment.yml
 conda activate fno_climate
 ```
 
-### 2. Download ERA5 data
+### 2. Configure CDS API access
 
-Register for a free account at [NCAR RDA](https://rda.ucar.edu/), then:
+Register for a free account at [Copernicus CDS](https://cds.climate.copernicus.eu),
+then create `~/.cdsapirc`:
+
+```
+url: https://cds.climate.copernicus.eu/api/v2
+key: <your-UID>:<your-API-key>
+```
+
+Your UID and API key are shown on your CDS profile page.
+
+### 3. Download ERA5 data
 
 ```bash
-export NCAR_USER="your_email@example.com"
-export NCAR_PASS="your_password"
 bash download_ERA5/download_era5_europe.sh
 ```
 
-This downloads ERA5 over **Europe** (−25°W to 45°E, 34°N to 72°N) at 0.25° resolution
-for two variables:
-- `VAR_2T` — 2-metre temperature [K]
-- `TP` — total precipitation [m]
+This downloads ERA5 for 1979–2021 at both 0.25° and 1.5° over Europe,
+sub-samples 8 random time steps per month, and saves paired files:
 
-Data is sub-sampled to 30 random time steps per month and saved as `data/samples_{year}.nc`.
+```
+data/
+├── samples_fine_1979.nc      ← 0.25°  T2m + TP, Europe, 1979
+├── samples_coarse_1979.nc    ← 1.5°   T2m + TP, Europe, 1979
+├── samples_fine_1980.nc
+├── samples_coarse_1980.nc
+...
+```
 
-> **Disk space:** approximately 5–10 GB for 1979–2022 after sub-sampling.
+> **Tip:** To download a single year for testing before running the full loop:
+> ```bash
+> python download_ERA5/download_month_cds.py --year 2000 --month 1 --n_samples 8
+> python download_ERA5/preprocess_concat_year.py --year 2000
+> ```
 
-You will also need the static ERA5 fields (geopotential + land-sea mask).
-Download them from the [Copernicus Climate Data Store](https://cds.climate.copernicus.eu)
-by selecting `geopotential (z)` and `land-sea mask (lsm)` under *Other* variables,
-save as `data/ERA5_const_sfc_variables.nc`.
+You also need the static ERA5 fields (geopotential + land-sea mask) from CDS:
+select `geopotential (z)` and `land-sea mask (lsm)` under *Other* variables,
+same domain, and save as `data/ERA5_const_sfc_variables.nc`.
 
-### 3. Train the FNO
+### 4. Train
 
 ```bash
 cd src
@@ -73,18 +111,18 @@ python train.py
 ```
 
 Default settings:
-- Training years: 1979–2016
-- Validation year: 2017
-- Downscaling factor: 4× (0.25° → 1.00° → 0.25°)
-- FNO: 4 layers, 64 channels, 16 Fourier modes per dimension
+- Training years: 1979–2016  (~3,700 samples)
+- Validation year: 2017  (~96 samples)
+- FNO: 4 layers, 64 hidden channels, 16 Fourier modes per dimension
 
 Key options:
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--data_dir` | `../data` | Path to ERA5 data directory |
-| `--coarsen_factor` | `4` | Spatial downscaling factor (try 2, 4, 8) |
-| `--epochs` | `100` | Number of training epochs |
+|---|---|---|
+| `--data_dir` | `../data` | Path to ERA5 data |
+| `--year_start` | `1979` | First training year |
+| `--year_val` | `2017` | First validation year |
+| `--epochs` | `100` | Training epochs |
 | `--batch_size` | `8` | Batch size |
 | `--hidden` | `64` | FNO hidden channel width |
 | `--n_modes` | `16` | Fourier modes per spatial dimension |
@@ -92,116 +130,84 @@ Key options:
 | `--with_dem` | off | Add DEM + land-sea mask as input channels |
 | `--lr` | `3e-4` | Learning rate |
 
-**Example: 8× downscaling with DEM conditioning**
+**Example: train with DEM conditioning (Step 4)**
 ```bash
-python train.py --coarsen_factor 8 --with_dem --epochs 200 --hidden 96
+python train.py --with_dem --epochs 150 --hidden 96
 ```
 
 Training produces:
 - `checkpoints/best.pt` — best validation checkpoint
-- `checkpoints/last.pt` — last epoch checkpoint
 - `results/sample_epoch{N}.png` — visual comparison every 10 epochs
 - `results/train_loss.png` — loss curve
 - TensorBoard logs in `runs/`
 
-Monitor training with:
 ```bash
 tensorboard --logdir runs/
 ```
 
-### 4. Evaluate
+### 5. Evaluate
 
 ```bash
 python evaluate.py --checkpoint ../checkpoints/best.pt --year_test 2018
 ```
 
-Outputs written to `results/eval/`:
-- `spatial_mae_T2m.png` / `spatial_mae_TP.png` — spatial maps of MAE
-- `example_t0_T2m.png` — coarse vs. FNO vs. truth for one time step
-- `spectrum_T2m.png` — power spectrum comparison
-
 Console output example:
 ```
 ──────────────────────────────────────────────
-Method               Metric  T2m         TP
+Method               Metric  T2m [K]     TP [m]
 ──────────────────────────────────────────────
-Bilinear (coarse)    RMSE   2.3104      4.12e-05
-                     MAE    1.7843      2.98e-05
-FNO                  RMSE   1.4211      2.87e-05
-                     MAE    1.0932      2.04e-05
+Bilinear (coarse)    RMSE    2.31        4.1e-05
+                     MAE     1.78        3.0e-05
+FNO                  RMSE    1.42        2.9e-05
+                     MAE     1.09        2.0e-05
 ──────────────────────────────────────────────
 ```
+
+Outputs saved to `results/eval/`:
+- `spatial_mae_T2m.png` — spatial map of MAE over Europe
+- `example_t0_T2m.png` — coarse / FNO / truth comparison
+- `spectrum_T2m.png` — power spectrum: does FNO recover fine-scale energy?
 
 ---
 
-## Understanding the code
-
-### Dataset (`src/dataset.py`)
-
-The dataset follows the same residual formulation as ClimateDiffuse:
-
-1. Load fine-resolution ERA5 fields (0.25°) as the **target**
-2. Coarsen by factor `k` using bilinear interpolation → **coarse** field
-3. Bilinearly upsample the coarse field back to the fine grid → **input to the model**
-4. The **target** for the network is the **residual** = fine − upsampled coarse
-5. Both input and residual are normalised channel-wise before training
-
-The model thus learns to predict the high-frequency detail missing from the
-coarsened input, which is a standard residual super-resolution formulation.
-
-### Model (`src/model.py`)
-
-The FNO2d model has three parts:
+## How the dataset works
 
 ```
-Input (B, C_in, H, W)
+CDS download
     │
-    ▼
-Lifting layer  [Conv 1×1: C_in → C_hidden]
-    │
-    ▼  × n_layers
-┌─────────────────────────────────────────────┐
-│  Spectral branch: FFT → R(ξ) · F(v) → iFFT │
-│  +                                          │
-│  Local branch: Conv 1×1                     │
-│  → InstanceNorm → GELU                      │
-└─────────────────────────────────────────────┘
-    │
-    ▼
-Projection  [Conv 1×1: C_hidden → 128 → C_out]
-    │
-    ▼
-Output residual (B, 2, H, W)
+    ├── samples_fine_{year}.nc    (0.25°)  ─── fine field          (N, 2, 149, 161)
+    └── samples_coarse_{year}.nc  (1.5°)   ─── coarse field        (N, 2,  26,  27)
+                                                        │
+                                           bilinear interpolation to 0.25° grid
+                                                        │
+                                              coarse_interp         (N, 2, 149, 161)
+                                                        │
+                            residual = fine − coarse_interp         (N, 2, 149, 161)
+                                                        │
+                                          normalise per channel
+                                                        │
+                                  ┌─────────────────────┴─────────────────────┐
+                              model input                               model target
+                           (normalised coarse_interp)           (normalised residual)
 ```
 
-The key operation in each FNO block (spectral branch):
+The model predicts the residual.  At inference time the final fine-resolution
+output is reconstructed as:
 
 ```
-v'(x) = F^{-1}[ R(ξ) · F(v)(ξ) ]  +  W v(x)
+prediction = coarse_interp + denormalise(predicted_residual)
 ```
-
-where `R(ξ)` are learnable complex weights for the lowest `n_modes` frequency components.
-
-### Training (`src/train.py`)
-
-- Loss: MSE on the normalised residual
-- Optimiser: AdamW with cosine annealing scheduler
-- Mixed-precision training with `torch.cuda.amp` on GPU
-- Gradient accumulation supported via `--accum`
 
 ---
 
 ## Thesis research plan
 
-This code covers **Step 1** of the thesis research plan.
-The remaining steps build directly on it:
-
-| Step | Task | What to change |
-|------|------|----------------|
+| Step | Task | What to modify |
+|---|---|---|
 | **1** | FNO baseline *(this code)* | Run as-is |
-| **2** | Compare U-FNO, U-Net, EDSR | Add new model classes to `src/model.py`, train each with the same script |
-| **3** | Physics-informed constraints (PINO) | Add a PDE residual loss term in `src/train.py` |
-| **4** | DEM as boundary condition | Use `--with_dem` flag; analyse the ablation |
+| **2** | Compare U-FNO, U-Net, EDSR | Add new classes to `src/model.py`; same train script |
+| **3** | Physics-informed constraints (PINO) | Add PDE residual loss term in `src/train.py` |
+| **4** | DEM as boundary condition | Enable `--with_dem`; run ablation |
 
 ---
 
