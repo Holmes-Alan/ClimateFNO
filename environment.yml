@@ -20,4 +20,5 @@ dependencies:
   - jupyter
   - pip
   - pip:
+      - cdsapi                   # Copernicus CDS API client
       - neuraloperator           # optional: Zongyi Li's reference FNO library
