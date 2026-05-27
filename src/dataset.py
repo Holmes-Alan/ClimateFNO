@@ -1,195 +1,241 @@
 """
 ERA5 Europe downscaling dataset.
-Adapted from ClimateDiffuse (Watt & Mansfield, 2024) for the European domain,
-targeting 2-metre temperature (T2m) and total precipitation (TP).
+Adapted from ClimateDiffuse (Watt & Mansfield, 2024).
 
-The dataset produces paired (low-resolution input, high-resolution target) samples
-by coarsening the native 0.25° ERA5 fields to a lower resolution and using the
-original fields as the supervision target.
+Key difference from ClimateDiffuse:
+  Both the fine (0.25°) and coarse (1.5°) fields are REAL ERA5 products
+  downloaded separately from the Copernicus CDS.  No synthetic coarsening
+  is performed.  The coarse field is bilinearly interpolated onto the fine
+  grid before being fed to the model, and the model learns the residual
+  between the fine field and this interpolated coarse field.
+
+Resolution:
+  Fine   : 0.25° × 0.25°  → 149 × 161 grid points over Europe (35–72°N, 10°W–30°E)
+  Coarse : 1.50° × 1.50°  →  26 ×  27 grid points  (6× downscaling factor)
+
+Dataset size per year (8 samples/month × 12 months = 96 samples):
+  Each fine sample  (2, 149, 161) float32 ≈ 190 KB
+  Total per year ≈ 18 MB  →  manageable on a single moderate GPU.
 """
 
 import numpy as np
 import torch
-import torchvision.transforms as T
+import torch.nn.functional as F
 import xarray as xr
 
 
-# ── Default normalisation statistics (computed over ERA5 Europe 1979-2017) ──────
-# Update these by running `compute_stats.py` on your own data.
-DEFAULT_MEAN = torch.tensor([281.0,  0.0])   # T2m [K], TP [m]
-DEFAULT_STD  = torch.tensor([ 14.0,  3e-4])  # rough estimates
+# ── Default normalisation statistics ─────────────────────────────────────────
+# Rough estimates for Europe; run compute_stats.py on your data to refine.
+DEFAULT_MEAN = torch.tensor([281.0,  0.0])    # T2m [K],  TP [m]
+DEFAULT_STD  = torch.tensor([ 14.0,  3e-4])   # T2m [K],  TP [m]
 
 
 class ERA5EuropeDataset(torch.utils.data.Dataset):
     """
-    Paired coarse/fine ERA5 dataset over Europe for two variables:
-      - VAR_2T  : 2-metre temperature [K]
-      - TP      : total precipitation [m]
+    Paired real coarse (1.5°) / fine (0.25°) ERA5 dataset over Europe.
 
-    Resolution pairs (default 4×):
-      fine   : 0.25°  → ~128 × 96  grid points over Europe bounding box
-      coarse : 1.00°  → ~ 32 × 24  grid points  (coarsen_factor=4)
+    Variables
+    ---------
+    VAR_2T : 2-metre temperature [K]
+    TP     : total precipitation [m]
 
-    The input to the FNO is the coarse field bilinearly interpolated back to
-    the fine grid (standard super-resolution setup).  The target is the
-    residual between the fine field and this interpolated coarse field,
-    following the same residual formulation as ClimateDiffuse.
+    The input to the FNO is the 1.5° coarse field bilinearly interpolated
+    to the 0.25° fine grid.  The training target is the residual:
+        residual = fine_field − interpolated_coarse_field
+
+    This residual formulation keeps the learning problem focused on the
+    high-frequency spatial detail that the coarse field cannot represent,
+    and follows the same strategy used in ClimateDiffuse.
 
     Parameters
     ----------
     data_dir : str
-        Path to directory containing `samples_{year}.nc` files.
-    year_start : int
-        First year (inclusive) to load.
-    year_end : int
-        Last year (exclusive) to load.
-    coarsen_factor : int
-        Spatial downscaling factor (default 4 → 0.25° fine, 1.00° coarse).
-    mean, std : torch.Tensor of shape (n_var,)
+        Directory containing  samples_fine_{year}.nc
+        and  samples_coarse_{year}.nc  files.
+    year_start, year_end : int
+        Year range [year_start, year_end) to load.
+    mean, std : torch.Tensor  (2,)
         Per-channel normalisation statistics for the raw fine-resolution data.
+        Defaults are rough estimates; compute from training data for best results.
     dem_file : str or None
-        Path to a NetCDF file containing the `z` (geopotential) and `lsm`
-        (land-sea mask) fields.  When provided, both fields are appended to
-        the input as extra conditioning channels (as in ClimateDiffuse).
+        Path to ERA5_const_sfc_variables.nc containing geopotential (z) and
+        land-sea mask (lsm).  When provided, both are appended as additional
+        input channels — useful for Step 4 of the thesis (DEM conditioning).
     """
 
-    # European bounding box (N→S latitude ordering in ERA5)
-    LAT_SLICE = slice(72.0, 34.0)
-    LON_SLICE = slice(345.0, 45.0)   # wraps: 345°E–360°E + 0°E–45°E
-    # For simplicity we use a non-wrapping slice; adjust if your download
-    # covers −25°W–45°E directly:
-    LAT_SLICE = slice(72.0, 34.0)
-    LON_SLICE = slice(335.0, 45.0)   # covers −25°W to 45°E as 335°E–405°E
-
-    VAR_NAMES = ["VAR_2T", "TP"]
+    # European domain as downloaded from CDS
+    # lat: 72°N → 35°N (descending, ERA5 convention)
+    # lon: −10°E → 30°E
+    LAT_SLICE = slice(72, 35)
+    LON_SLICE = slice(-10, 30)
 
     def __init__(
         self,
-        data_dir: str,
+        data_dir:   str,
         year_start: int = 1979,
         year_end:   int = 2017,
-        coarsen_factor: int = 4,
         mean: torch.Tensor = DEFAULT_MEAN,
         std:  torch.Tensor = DEFAULT_STD,
         dem_file: str | None = None,
     ):
-        self.data_dir      = data_dir
-        self.coarsen_factor = coarsen_factor
         self.mean = mean
         self.std  = std
 
-        # ── Load all yearly files ────────────────────────────────────────────
-        print(f"Loading ERA5 Europe data for years {year_start}–{year_end-1} …")
-        datasets = []
+        # ── Load fine and coarse yearly files ─────────────────────────────────
+        print(f"Loading ERA5 Europe data for years {year_start}–{year_end - 1} …")
+        fine_list, coarse_list, time_list = [], [], []
+
         for year in range(year_start, year_end):
-            path = f"{data_dir}/samples_{year}.nc"
-            ds   = xr.open_dataset(path, engine="netcdf4")
-            ds   = self._crop_europe(ds)
-            datasets.append(ds)
-        ds_all = xr.concat(datasets, dim="time")
-        print(f"  Loaded {len(ds_all.time)} time steps.")
+            fine_path   = f"{data_dir}/samples_fine_{year}.nc"
+            coarse_path = f"{data_dir}/samples_coarse_{year}.nc"
 
-        self.lat = ds_all.latitude
-        self.lon = ds_all.longitude
-        self.H   = len(self.lat)
-        self.W   = len(self.lon)
+            ds_fine   = xr.open_dataset(fine_path,   engine="netcdf4")
+            ds_coarse = xr.open_dataset(coarse_path, engine="netcdf4")
+
+            # Crop to European domain (in case files are global)
+            ds_fine   = ds_fine.sel(latitude=self.LAT_SLICE,
+                                    longitude=self.LON_SLICE)
+            ds_coarse = ds_coarse.sel(latitude=self.LAT_SLICE,
+                                      longitude=self.LON_SLICE)
+
+            # Align on shared time steps (should already match from download)
+            common = np.intersect1d(ds_fine.time.values, ds_coarse.time.values)
+            ds_fine   = ds_fine.sel(time=common)
+            ds_coarse = ds_coarse.sel(time=common)
+
+            fine_list.append(ds_fine)
+            coarse_list.append(ds_coarse)
+            time_list.append(common)
+
+        ds_fine   = xr.concat(fine_list,   dim="time")
+        ds_coarse = xr.concat(coarse_list, dim="time")
+
+        self.lat_fine   = ds_fine.latitude.values
+        self.lon_fine   = ds_fine.longitude.values
+        self.lat_coarse = ds_coarse.latitude.values
+        self.lon_coarse = ds_coarse.longitude.values
+
+        self.H = len(self.lat_fine)   # e.g. 149
+        self.W = len(self.lon_fine)   # e.g. 161
         self.fine_shape   = (self.H, self.W)
-        self.coarse_shape = (self.H // coarsen_factor, self.W // coarsen_factor)
+        self.coarse_shape = (len(self.lat_coarse), len(self.lon_coarse))
 
-        # ── Build fine-resolution tensor (ntime, 2, H, W) ───────────────────
-        t2m = torch.from_numpy(ds_all["VAR_2T"].values).float()   # (T, H, W)
-        tp  = torch.from_numpy(ds_all["TP"].values).float()        # (T, H, W)
-        fine = torch.stack([t2m, tp], dim=1)                       # (T, 2, H, W)
+        print(f"  Fine grid  : {self.fine_shape}  (0.25°)")
+        print(f"  Coarse grid: {self.coarse_shape}  (1.5°)")
+        print(f"  Time steps : {len(ds_fine.time)}")
 
-        # ── Build coarse input by resizing down then back up ─────────────────
-        coarsen  = T.Resize(self.coarse_shape,
-                            interpolation=T.InterpolationMode.BILINEAR,
-                            antialias=True)
-        upsample = T.Resize(self.fine_shape,
-                            interpolation=T.InterpolationMode.BILINEAR,
-                            antialias=True)
-        coarse = upsample(coarsen(fine))                           # (T, 2, H, W)
+        # ── Build tensors ──────────────────────────────────────────────────────
+        # Fine field  (N, 2, H_fine, W_fine)
+        t2m_fine = torch.from_numpy(ds_fine["VAR_2T"].values).float()
+        tp_fine  = torch.from_numpy(ds_fine["TP"].values).float()
+        fine     = torch.stack([t2m_fine, tp_fine], dim=1)
 
-        # ── Residual target ──────────────────────────────────────────────────
-        residual = fine - coarse                                   # (T, 2, H, W)
+        # Coarse field  (N, 2, H_coarse, W_coarse)
+        t2m_coarse = torch.from_numpy(ds_coarse["VAR_2T"].values).float()
+        tp_coarse  = torch.from_numpy(ds_coarse["TP"].values).float()
+        coarse_native = torch.stack([t2m_coarse, tp_coarse], dim=1)
 
-        # Keep un-normalised copies for plotting / evaluation
-        self.fine   = fine
-        self.coarse = coarse
+        # Interpolate coarse → fine grid using bilinear interpolation
+        # so both fields live on the same 0.25° grid
+        coarse_interp = F.interpolate(
+            coarse_native,
+            size=self.fine_shape,
+            mode="bilinear",
+            align_corners=True,
+        )                                              # (N, 2, H_fine, W_fine)
 
-        # ── Normalise ────────────────────────────────────────────────────────
-        norm_raw      = T.Normalize(mean.tolist(), std.tolist())
-        residual_mean = residual.mean(dim=(0, 2, 3))
-        residual_std  = residual.std(dim=(0, 2, 3)).clamp(min=1e-6)
-        self.residual_mean = residual_mean
-        self.residual_std  = residual_std
-        norm_residual = T.Normalize(residual_mean.tolist(), residual_std.tolist())
+        # Residual: what the FNO must learn to predict
+        residual = fine - coarse_interp               # (N, 2, H_fine, W_fine)
 
-        self.inputs  = norm_raw(coarse)       # (T, 2, H, W)  normalised coarse
-        self.targets = norm_residual(residual) # (T, 2, H, W)  normalised residual
+        # Store un-normalised copies for evaluation and plotting
+        self.fine          = fine
+        self.coarse_native = coarse_native
+        self.coarse_interp = coarse_interp
 
-        # ── Optional: DEM + land-sea mask ────────────────────────────────────
+        # ── Normalisation ──────────────────────────────────────────────────────
+        # Normalise the coarse input using raw-data statistics
+        coarse_norm = (coarse_interp - mean[None, :, None, None]) \
+                    /  std[None, :, None, None]
+
+        # Normalise the residual using its own mean/std (computed from training data)
+        self.residual_mean = residual.mean(dim=(0, 2, 3))
+        self.residual_std  = residual.std(dim=(0, 2, 3)).clamp(min=1e-8)
+        residual_norm = (residual - self.residual_mean[None, :, None, None]) \
+                      /  self.residual_std[None, :, None, None]
+
+        self.inputs  = coarse_norm    # (N, 2, H, W)  model input
+        self.targets = residual_norm  # (N, 2, H, W)  model target
+
+        # ── Optional DEM + land-sea mask (Step 4) ─────────────────────────────
         self.n_input_channels = 2
         if dem_file is not None:
             print("  Loading DEM / land-sea mask …")
             ds_dem = xr.open_dataset(dem_file, engine="netcdf4")
-            ds_dem = self._crop_europe(ds_dem)
+            ds_dem = ds_dem.sel(latitude=self.LAT_SLICE, longitude=self.LON_SLICE)
 
-            # Geopotential → normalise
-            z   = torch.from_numpy(ds_dem["z"].values).float()
-            z   = (z - z.mean()) / z.std().clamp(min=1e-6)
-            # Land-sea mask → keep as-is (0/1)
+            # Geopotential: normalise to zero mean, unit variance
+            z = torch.from_numpy(ds_dem["z"].values).float()
+            z = (z - z.mean()) / z.std().clamp(min=1e-8)
+
+            # Land-sea mask: already in [0, 1]
             lsm = torch.from_numpy(ds_dem["lsm"].values).float()
 
-            # Both are (H, W) → broadcast over time
-            T_   = self.inputs.shape[0]
-            z    = z.unsqueeze(0).expand(T_, -1, -1)    # (T, H, W)
-            lsm  = lsm.unsqueeze(0).expand(T_, -1, -1)  # (T, H, W)
-            aux  = torch.stack([z, lsm], dim=1)         # (T, 2, H, W)
-            self.inputs = torch.cat([self.inputs, aux], dim=1)  # (T, 4, H, W)
-            self.n_input_channels = 4
-            print("  DEM channels added.  Input channels: 4.")
+            # Interpolate to fine grid if needed
+            def _interp_static(field_2d: torch.Tensor) -> torch.Tensor:
+                """Interpolate a (H', W') static field to (H, W)."""
+                return F.interpolate(
+                    field_2d.unsqueeze(0).unsqueeze(0),
+                    size=self.fine_shape,
+                    mode="bilinear",
+                    align_corners=True,
+                ).squeeze()
 
-        # ── Time metadata ────────────────────────────────────────────────────
-        time = ds_all.time.dt
+            z   = _interp_static(z)
+            lsm = _interp_static(lsm)
+
+            N = self.inputs.shape[0]
+            aux = torch.stack([
+                z.expand(N, -1, -1),
+                lsm.expand(N, -1, -1),
+            ], dim=1)                                  # (N, 2, H, W)
+
+            self.inputs = torch.cat([self.inputs, aux], dim=1)  # (N, 4, H, W)
+            self.n_input_channels = 4
+            print("  DEM channels appended — input channels: 4")
+
+        # ── Time metadata ──────────────────────────────────────────────────────
+        time = ds_fine.time.dt
         self.doy_norm  = torch.from_numpy(
             ((time.month.values - 1) * 30 + (time.day.values - 1)) / 360.0
         ).float()
         self.hour_norm = torch.from_numpy(time.hour.values / 24.0).float()
 
-        print("Dataset ready.")
+        print("Dataset ready.\n")
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _crop_europe(self, ds: xr.Dataset) -> xr.Dataset:
-        """Crop dataset to the European bounding box."""
-        return ds.sel(
-            latitude=self.LAT_SLICE,
-            longitude=self.LON_SLICE,
-        )
+    def inverse_normalise_residual(self, res_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalised residual back to physical units [K] / [m]."""
+        return (res_norm
+                * self.residual_std[None, :, None, None]
+                + self.residual_mean[None, :, None, None])
 
-    def inverse_normalise_residual(self, residual_norm: torch.Tensor) -> torch.Tensor:
-        """Convert normalised residual back to physical units."""
-        return (residual_norm
-                * self.residual_std[:, None, None]
-                + self.residual_mean[:, None, None])
+    def residual_to_fine(self, res_norm: torch.Tensor,
+                         coarse_interp: torch.Tensor) -> torch.Tensor:
+        """Reconstruct fine-resolution field from predicted normalised residual."""
+        return coarse_interp + self.inverse_normalise_residual(res_norm)
 
-    def residual_to_fine(self, residual_norm: torch.Tensor,
-                         coarse: torch.Tensor) -> torch.Tensor:
-        """Reconstruct fine-resolution field from predicted residual."""
-        return coarse + self.inverse_normalise_residual(residual_norm)
-
-    # ── PyTorch Dataset interface ─────────────────────────────────────────────
+    # ── PyTorch interface ─────────────────────────────────────────────────────
 
     def __len__(self) -> int:
         return self.inputs.shape[0]
 
     def __getitem__(self, idx: int) -> dict:
         return {
-            "inputs":  self.inputs[idx],          # normalised coarse (+DEM)
-            "targets": self.targets[idx],          # normalised residual
-            "fine":    self.fine[idx],             # raw fine field
-            "coarse":  self.coarse[idx],           # raw coarse field
-            "doy":     self.doy_norm[idx],
-            "hour":    self.hour_norm[idx],
+            "inputs":        self.inputs[idx],        # normalised coarse (on fine grid)
+            "targets":       self.targets[idx],        # normalised residual
+            "fine":          self.fine[idx],           # raw 0.25° fine field
+            "coarse_interp": self.coarse_interp[idx],  # raw 1.5° coarse on fine grid
+            "doy":           self.doy_norm[idx],
+            "hour":          self.hour_norm[idx],
         }
