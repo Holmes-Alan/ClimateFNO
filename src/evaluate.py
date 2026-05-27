@@ -28,7 +28,6 @@ def parse_args():
     p.add_argument("--checkpoint",     type=str, default="../checkpoints/best.pt")
     p.add_argument("--data_dir",       type=str, default="../data")
     p.add_argument("--year_test",      type=int, default=2018)
-    p.add_argument("--coarsen_factor", type=int, default=4)
     p.add_argument("--with_dem",       action="store_true")
     p.add_argument("--dem_file",       type=str,
                    default="../data/ERA5_const_sfc_variables.nc")
@@ -61,7 +60,7 @@ def evaluate(model, dataset, device, batch_size=16):
     for batch in loader:
         x      = batch["inputs"].to(device)
         fine   = batch["fine"].to(device)
-        coarse = batch["coarse"].to(device)
+        coarse = batch["coarse_interp"].to(device)
         doy    = batch["doy"].to(device)
         hour   = batch["hour"].to(device)
 
@@ -210,7 +209,6 @@ def main():
         data_dir=args.data_dir,
         year_start=args.year_test,
         year_end=args.year_test + 1,
-        coarsen_factor=args.coarsen_factor,
         dem_file=dem_file,
     )
 
