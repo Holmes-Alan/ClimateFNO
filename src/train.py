@@ -41,7 +41,6 @@ def parse_args():
     p.add_argument("--year_end",      type=int,   default=2017)
     p.add_argument("--year_val",      type=int,   default=2017,
                    help="First year of validation split (year_val to year_val+1)")
-    p.add_argument("--coarsen_factor",type=int,   default=4)
     p.add_argument("--epochs",        type=int,   default=100)
     p.add_argument("--batch_size",    type=int,   default=8)
     p.add_argument("--lr",            type=float, default=3e-4)
@@ -110,7 +109,7 @@ def validate(model, loader, device):
         x      = batch["inputs"].to(device)
         target = batch["targets"].to(device)
         fine   = batch["fine"].to(device)
-        coarse = batch["coarse"].to(device)
+        coarse = batch["coarse_interp"].to(device)
         doy    = batch["doy"].to(device)
         hour   = batch["hour"].to(device)
 
@@ -147,7 +146,7 @@ def save_sample_figure(model, dataset, device, path, n=3):
         doy    = sample["doy"].unsqueeze(0).to(device)
         hour   = sample["hour"].unsqueeze(0).to(device)
         fine   = sample["fine"]
-        coarse = sample["coarse"]
+        coarse = sample["coarse_interp"]
 
         pred_res = model(x, doy=doy, hour=hour).squeeze(0).cpu()
         res_mean = dataset.residual_mean
@@ -196,7 +195,7 @@ def main():
         data_dir=args.data_dir,
         year_start=args.year_start,
         year_end=args.year_val,
-        coarsen_factor=args.coarsen_factor,
+        
         dem_file=dem_file,
     )
     print("Building validation dataset …")
@@ -204,7 +203,7 @@ def main():
         data_dir=args.data_dir,
         year_start=args.year_val,
         year_end=args.year_val + 1,
-        coarsen_factor=args.coarsen_factor,
+        
         dem_file=dem_file,
         # Re-use training normalisation statistics
         mean=ds_train.mean,
