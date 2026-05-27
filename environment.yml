@@ -1,0 +1,23 @@
+name: fno_climate
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.1
+  - torchvision
+  - pytorch-cuda=12.1          # remove if CPU-only
+  - xarray
+  - netcdf4
+  - scipy
+  - numpy
+  - matplotlib
+  - cartopy
+  - tensorboard
+  - tqdm
+  - jupyter
+  - pip
+  - pip:
+      - neuraloperator           # optional: Zongyi Li's reference FNO library
